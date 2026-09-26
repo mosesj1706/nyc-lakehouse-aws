@@ -1,0 +1,159 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  NYC taxi lakehouse: one S3 bucket with raw/curated zones, a Glue database,
+  a crawler per zone, a PySpark ETL job, and an Athena workgroup that writes
+  its results back into the same bucket. Everything the pipeline needs is in
+  this template - nothing is created by hand in the console.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: nyc-lakehouse
+    Description: Prefix for resource names.
+  GlueVersion:
+    Type: String
+    Default: "5.0"
+    AllowedValues: ["4.0", "5.0", "6.0"]
+    Description: Glue Spark runtime. 6.0 (Spark 4.2) where the region supports it.
+
+Resources:
+  # ---------------------------------------------------------------- storage
+  DataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${ProjectName}-${AWS::AccountId}-${AWS::Region}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          # Athena query results are disposable; keeping them costs money for nothing.
+          - Id: expire-athena-results
+            Status: Enabled
+            Prefix: athena-results/
+            ExpirationInDays: 7
+
+  # ---------------------------------------------------------------- catalog
+  GlueDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: !Sub "${ProjectName}_db"
+        Description: Raw and curated NYC taxi tables.
+
+  # ---------------------------------------------------------------- iam
+  GlueRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-glue-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: glue.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+      Policies:
+        # Scoped to this bucket only: the managed policy above covers the catalog,
+        # this covers the data, and nothing else in the account is reachable.
+        - PolicyName: bucket-access
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [s3:GetObject, s3:PutObject, s3:DeleteObject]
+                Resource: !Sub "${DataBucket.Arn}/*"
+              - Effect: Allow
+                Action: [s3:ListBucket, s3:GetBucketLocation]
+                Resource: !GetAtt DataBucket.Arn
+
+  # ---------------------------------------------------------------- crawlers
+  RawCrawler:
+    Type: AWS::Glue::Crawler
+    Properties:
+      Name: !Sub "${ProjectName}-raw-crawler"
+      Role: !GetAtt GlueRole.Arn
+      DatabaseName: !Ref GlueDatabase
+      TablePrefix: raw_
+      Targets:
+        S3Targets:
+          - Path: !Sub "s3://${DataBucket}/raw/yellow_tripdata/"
+      SchemaChangePolicy:
+        UpdateBehavior: UPDATE_IN_DATABASE
+        DeleteBehavior: LOG
+
+  CuratedCrawler:
+    Type: AWS::Glue::Crawler
+    Properties:
+      Name: !Sub "${ProjectName}-curated-crawler"
+      Role: !GetAtt GlueRole.Arn
+      DatabaseName: !Ref GlueDatabase
+      TablePrefix: curated_
+      Targets:
+        S3Targets:
+          - Path: !Sub "s3://${DataBucket}/curated/trips/"
+      SchemaChangePolicy:
+        UpdateBehavior: UPDATE_IN_DATABASE
+        DeleteBehavior: LOG
+
+  # ---------------------------------------------------------------- etl job
+  CurateJob:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: !Sub "${ProjectName}-curate"
+      Role: !GetAtt GlueRole.Arn
+      GlueVersion: !Ref GlueVersion
+      WorkerType: G.1X
+      NumberOfWorkers: 2          # the minimum; this dataset does not need more
+      Timeout: 20                 # minutes - a runaway job cannot quietly bill all day
+      MaxRetries: 0
+      ExecutionProperty:
+        MaxConcurrentRuns: 1
+      Command:
+        Name: glueetl
+        PythonVersion: "3"
+        ScriptLocation: !Sub "s3://${DataBucket}/scripts/curate.py"
+      DefaultArguments:
+        "--job-language": python
+        "--job-bookmark-option": job-bookmark-enable   # re-runs only pick up new files
+        "--enable-metrics": "true"
+        "--enable-continuous-cloudwatch-log": "true"
+        "--database": !Ref GlueDatabase
+        "--source_table": raw_yellow_tripdata
+        "--target_path": !Sub "s3://${DataBucket}/curated/trips/"
+
+  # ---------------------------------------------------------------- athena
+  AthenaWorkGroup:
+    Type: AWS::Athena::WorkGroup
+    Properties:
+      Name: !Sub "${ProjectName}-wg"
+      State: ENABLED
+      RecursiveDeleteOption: true
+      WorkGroupConfiguration:
+        EnforceWorkGroupConfiguration: true
+        PublishCloudWatchMetricsEnabled: true
+        BytesScannedCutoffPerQuery: 1073741824   # 1 GB ceiling per query, so a bad query cannot cost much
+        ResultConfiguration:
+          OutputLocation: !Sub "s3://${DataBucket}/athena-results/"
+
+Outputs:
+  BucketName:
+    Value: !Ref DataBucket
+  DatabaseName:
+    Value: !Ref GlueDatabase
+  RawCrawlerName:
+    Value: !Ref RawCrawler
+  CuratedCrawlerName:
+    Value: !Ref CuratedCrawler
+  JobName:
+    Value: !Ref CurateJob
+  WorkGroupName:
+    Value: !Ref AthenaWorkGroup
