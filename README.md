@@ -17,6 +17,8 @@ NYC TLC Parquet ──► s3://…/raw/yellow_tripdata/month=YYYY-MM/
                     Glue crawler ──► curated_trips ──► Athena
 ```
 
+![Architecture](docs/architecture.png)
+
 Fuller diagram and the reasoning behind each choice: [docs/architecture.md](docs/architecture.md).
 
 ## Running it
